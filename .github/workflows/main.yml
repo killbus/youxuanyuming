@@ -27,5 +27,6 @@ jobs:
     - name: Run update script
       env:
         CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+        CF_ZONE_NAME: ${{ secrets.CF_ZONE_NAME }}
       run: |
         python bestdomain.py

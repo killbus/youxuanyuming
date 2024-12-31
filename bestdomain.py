@@ -6,12 +6,12 @@ def get_ip_list(url):
     response.raise_for_status()
     return response.text.strip().split('\n')
 
-def get_cloudflare_zone(api_token):
+def get_cloudflare_zone(api_token, zone_name: str = None):
     headers = {
         'Authorization': f'Bearer {api_token}',
         'Content-Type': 'application/json',
     }
-    response = requests.get('https://api.cloudflare.com/client/v4/zones', headers=headers)
+    response = requests.get(f'https://api.cloudflare.com/client/v4/zones?name={zone_name}&status=active&page=1&per_page=1&order=status&direction=desc&match=all', headers=headers)
     response.raise_for_status()
     zones = response.json().get('result', [])
     if not zones:
@@ -57,17 +57,18 @@ def update_cloudflare_dns(ip_list, api_token, zone_id, subdomain, domain):
 
 if __name__ == "__main__":
     api_token = os.getenv('CF_API_TOKEN')
+    zone_name = os.getenv('CF_ZONE_NAME')
     
     # 示例URL和子域名对应的IP列表
     subdomain_ip_mapping = {
-        'bestcf': 'https://ipdb.030101.xyz/api/bestcf.txt',  # #域名一，bestcf.域名.com
-        'api': 'https://raw.githubusercontent.com/jc-lw/youxuanyuming/refs/heads/main/ip.txt', #域名二，api.域名.com
+        # 'bestcf': 'https://ipdb.030101.xyz/api/bestcf.txt',  # #域名一，bestcf.域名.com
+        'bestcf.chore': 'https://raw.githubusercontent.com/killbus/youxuanyuming/refs/heads/main/ip.txt', #域名二，api.域名.com
         # 添加更多子域名和对应的IP列表URL
     }
     
     try:
         # 获取Cloudflare域区ID和域名
-        zone_id, domain = get_cloudflare_zone(api_token)
+        zone_id, domain = get_cloudflare_zone(api_token, zone_name)
         
         for subdomain, url in subdomain_ip_mapping.items():
             # 获取IP列表
