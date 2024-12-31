@@ -2,43 +2,111 @@ import requests
 from bs4 import BeautifulSoup
 import re
 import os
+import ipaddress
+import logging
+from typing import List, Set
+from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor
+from requests.adapters import HTTPAdapter
+from urllib3.util import Retry
 
-# 目标URL列表
-urls = ['https://ip.164746.xyz/ipTop10.html', 
-        'https://cf.090227.xyz'
-        ]
+@dataclass
+class Config:
+    urls: List[str]
+    output_file: str
+    ip_pattern: str = r'\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}'
+    timeout: int = 10
+    max_workers: int = 3
 
-# 正则表达式用于匹配IP地址
-ip_pattern = r'\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}'
-
-# 检查ip.txt文件是否存在,如果存在则删除它
-if os.path.exists('ip.txt'):
-    os.remove('ip.txt')
-
-# 创建一个文件来存储IP地址
-with open('ip.txt', 'w') as file:
-    for url in urls:
-        # 发送HTTP请求获取网页内容
-        response = requests.get(url)
+class CloudflareIPScraper:
+    def __init__(self, config: Config):
+        self.config = config
+        self.session = self._setup_session()
+        self._setup_logging()
         
-        # 使用BeautifulSoup解析HTML
-        soup = BeautifulSoup(response.text, 'html.parser')
-        
-        # 根据网站的不同结构找到包含IP地址的元素
-        if url == 'https://ip.164746.xyz/ipTop10.html':
-            elements = soup.find_all('tr')
-        elif url == 'https://cf.090227.xyz':
-            elements = soup.find_all('tr')
-        else:
-            elements = soup.find_all('li')
-        
-        # 遍历所有元素,查找IP地址
-        for element in elements:
-            element_text = element.get_text()
-            ip_matches = re.findall(ip_pattern, element_text)
+    def _setup_logging(self) -> None:
+        logging.basicConfig(
+            level=logging.INFO,
+            format='%(asctime)s - %(levelname)s - %(message)s'
+        )
+
+    def _setup_session(self) -> requests.Session:
+        session = requests.Session()
+        retry = Retry(total=3, backoff_factor=1, status_forcelist=[500, 502, 503, 504])
+        adapter = HTTPAdapter(max_retries=retry)
+        session.mount('http://', adapter)
+        session.mount('https://', adapter)
+        return session
+
+    def get_cloudflare_ranges(self) -> Set[ipaddress.IPv4Network]:
+        try:
+            v4_ranges = self.session.get('https://www.cloudflare.com/ips-v4', 
+                                       timeout=self.config.timeout).text.strip().split('\n')
+            return {ipaddress.ip_network(network) for network in v4_ranges}
+        except Exception as e:
+            logging.error(f"Error fetching Cloudflare ranges: {e}")
+            return set()
+
+    def is_cloudflare_ip(self, ip: str, cf_ranges: Set[ipaddress.IPv4Network]) -> bool:
+        try:
+            ip_obj = ipaddress.ip_address(ip)
+            return any(ip_obj in network for network in cf_ranges)
+        except ValueError:
+            return False
+
+    def scrape_url(self, url: str) -> Set[str]:
+        try:
+            response = self.session.get(url, timeout=self.config.timeout)
+            response.raise_for_status()
             
-            # 如果找到IP地址,则写入文件
-            for ip in ip_matches:
-                file.write(ip + '\n')
+            soup = BeautifulSoup(response.text, 'html.parser')
+            elements = soup.find_all('tr')
+            
+            ips = set()
+            for element in elements:
+                element_text = element.get_text()
+                ip_matches = re.findall(self.config.ip_pattern, element_text)
+                ips.update(ip_matches)
+                
+            return ips
+            
+        except Exception as e:
+            logging.error(f"Error scraping {url}: {e}")
+            return set()
 
-print('IP地址已保存到ip.txt文件中。')
+    def run(self) -> None:
+        cf_ranges = self.get_cloudflare_ranges()
+        if not cf_ranges:
+            logging.error("Failed to fetch Cloudflare ranges. Exiting.")
+            return
+
+        all_ips = set()
+        with ThreadPoolExecutor(max_workers=self.config.max_workers) as executor:
+            results = executor.map(self.scrape_url, self.config.urls)
+            for ips in results:
+                all_ips.update(ips)
+
+        cloudflare_ips = {ip for ip in all_ips if self.is_cloudflare_ip(ip, cf_ranges)}
+        
+        if cloudflare_ips:
+            try:
+                with open(self.config.output_file, 'w') as f:
+                    f.write('\n'.join(sorted(cloudflare_ips)) + '\n')
+                logging.info(f"Saved {len(cloudflare_ips)} Cloudflare IPs to {self.config.output_file}")
+            except IOError as e:
+                logging.error(f"Error writing to file: {e}")
+        else:
+            logging.warning("No valid Cloudflare IPs found")
+
+def main():
+    config = Config(
+        urls=['https://ip.164746.xyz/ipTop10.html', 
+              'https://cf.090227.xyz'],
+        output_file='ip.txt'
+    )
+    
+    scraper = CloudflareIPScraper(config)
+    scraper.run()
+
+if __name__ == "__main__":
+    main()
