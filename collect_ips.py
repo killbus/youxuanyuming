@@ -1,3 +1,4 @@
+from collections.abc import Callable
 import requests
 from bs4 import BeautifulSoup
 import re
@@ -11,12 +12,33 @@ from requests.adapters import HTTPAdapter
 from urllib3.util import Retry
 
 @dataclass
+class URLConfig:
+    url: str
+    parser: Callable[[str, str], Set[str]]
+
+@dataclass
 class Config:
-    urls: List[str]
+    urls: List[URLConfig]  # 使用结构化的 URL 配置
     output_file: str
     ip_pattern: str = r'\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}'
     timeout: int = 10
     max_workers: int = 3
+
+def parse_table_ips(html: str, ip_pattern: str) -> Set[str]:
+    """解析 HTML 表格中的 IP 地址."""
+    soup = BeautifulSoup(html, 'html.parser')
+    elements = soup.find_all('tr')
+    ips = set()
+    for element in elements:
+        element_text = element.get_text()
+        ip_matches = re.findall(ip_pattern, element_text)
+        ips.update(ip_matches)
+    return ips
+
+def parse_comma_separated_ips(text: str, ip_pattern: str) -> Set[str]:
+    """解析逗号分隔的 IP 地址."""
+    ip_matches = re.findall(ip_pattern, text)
+    return set(ip_matches)
 
 class CloudflareIPScraper:
     def __init__(self, config: Config):
@@ -54,22 +76,11 @@ class CloudflareIPScraper:
         except ValueError:
             return False
 
-    def scrape_url(self, url: str) -> Set[str]:
+    def scrape_url(self, url: str, parser: Callable[[str, str], Set[str]]) -> Set[str]:
         try:
             response = self.session.get(url, timeout=self.config.timeout)
             response.raise_for_status()
-            
-            soup = BeautifulSoup(response.text, 'html.parser')
-            elements = soup.find_all('tr')
-            
-            ips = set()
-            for element in elements:
-                element_text = element.get_text()
-                ip_matches = re.findall(self.config.ip_pattern, element_text)
-                ips.update(ip_matches)
-                
-            return ips
-            
+            return parser(response.text, self.config.ip_pattern)
         except Exception as e:
             logging.error(f"Error scraping {url}: {e}")
             return set()
@@ -82,7 +93,10 @@ class CloudflareIPScraper:
 
         all_ips = set()
         with ThreadPoolExecutor(max_workers=self.config.max_workers) as executor:
-            results = executor.map(self.scrape_url, self.config.urls)
+            results = executor.map(
+                lambda url_config: self.scrape_url(url_config.url, url_config.parser),
+                self.config.urls
+            )
             for ips in results:
                 all_ips.update(ips)
 
@@ -100,8 +114,10 @@ class CloudflareIPScraper:
 
 def main():
     config = Config(
-        urls=['https://ip.164746.xyz/ipTop10.html', 
-              'https://cf.090227.xyz'],
+        urls=[
+            URLConfig(url="https://ip.164746.xyz/ipTop10.html", parser=parse_comma_separated_ips),
+            URLConfig(url="https://cf.090227.xyz", parser=parse_table_ips)
+        ],
         output_file='ip.txt'
     )
     
