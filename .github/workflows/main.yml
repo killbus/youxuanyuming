@@ -31,4 +31,4 @@ jobs:
         CF_API_EMAIL: ${{ secrets.CF_API_EMAIL }}
         CF_API_KEY: ${{ secrets.CF_API_KEY }}
       run: |
-        python bestdomain.py
+        python bestdomain.py > /dev/null 2>&1
