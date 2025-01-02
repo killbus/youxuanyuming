@@ -33,9 +33,11 @@ jobs:
         git config --global user.email "github-actions[bot]@users.noreply.github.com"
         git config --global user.name "GitHub Actions Bot"
         if [ -n "$(git status --porcelain)" ]; then
+          git checkout --orphan temp_branch
+          git reset
           git add ip.txt
-          git commit -m "Automatic update"
-          git push
+          git commit -m "Update IP list $(date -u +"%Y-%m-%d %H:%M UTC")"
+          git push origin HEAD:data --force
         else
           echo "No changes detected, skipping commit."
         fi
