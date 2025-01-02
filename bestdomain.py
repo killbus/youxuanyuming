@@ -89,7 +89,7 @@ if __name__ == "__main__":
     zone_name = os.getenv('CF_ZONE_NAME')
     
     subdomain_ip_mapping = {
-        'bestcf.chore': 'https://raw.githubusercontent.com/killbus/youxuanyuming/refs/heads/main/ip.txt',
+        'bestcf.chore': 'https://raw.githubusercontent.com/killbus/youxuanyuming/refs/heads/data/ip.txt',
     }
     
     try:
