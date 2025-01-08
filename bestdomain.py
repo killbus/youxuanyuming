@@ -91,7 +91,11 @@ if __name__ == "__main__":
     subdomain_ip_mapping = {
         'bestcf.chore': 'https://raw.githubusercontent.com/killbus/youxuanyuming/refs/heads/data/ip.txt',
     }
-    
+    subdomain_ip_mapping_env = os.getenv('SUBDOMAIN_IP_MAPPING')
+    if subdomain_ip_mapping_env:
+        mappings = subdomain_ip_mapping_env.strip().split('\n')
+        subdomain_ip_mapping.update({subdomain: url for mapping in mappings for subdomain, url in [mapping.split(',')]})
+
     try:
         zone_id, domain = get_cloudflare_zone(auth_params, zone_name)
         

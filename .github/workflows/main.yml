@@ -30,5 +30,6 @@ jobs:
         CF_ZONE_NAME: ${{ secrets.CF_ZONE_NAME }}
         CF_API_EMAIL: ${{ secrets.CF_API_EMAIL }}
         CF_API_KEY: ${{ secrets.CF_API_KEY }}
+        SUBDOMAIN_IP_MAPPING: ${{ secrets.SUBDOMAIN_IP_MAPPING }}
       run: |
         python bestdomain.py > /dev/null 2>&1
