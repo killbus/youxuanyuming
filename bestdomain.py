@@ -287,7 +287,7 @@ if __name__ == "__main__":
         zone_id, domain = get_cloudflare_zone(auth_params, zone_name)
 
         for subdomain, url in subdomain_ip_mapping.items():
-            ip_list = get_ip_list(url)
+            ip_list = get_ip_list(url)[:10]
             update_dns_records(auth_params, ip_list, zone_id, subdomain, domain, use_batch)
             
     except Exception as e:
