@@ -2,6 +2,7 @@ import os
 import requests
 import logging
 from typing import Tuple, List
+from enum import Enum, auto
 
 # 设置日志配置
 logging.basicConfig(
@@ -11,10 +12,41 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-def get_ip_list(url: str) -> List[str]:
+class DNSRecordType(Enum):
+    ALL = auto()
+    A_ONLY = auto()
+    AAAA_ONLY = auto()
+    
+    @classmethod
+    def from_string(cls, value: str) -> 'DNSRecordType':
+        """从字符串转换为枚举值，无效值返回 ALL"""
+        try:
+            return {
+                'all': cls.ALL,
+                'a': cls.A_ONLY,
+                'ipv4': cls.A_ONLY,
+                'aaaa': cls.AAAA_ONLY,
+                'ipv6': cls.AAAA_ONLY
+            }[value.lower()]
+        except KeyError:
+            return cls.ALL
+
+def get_ip_list(url: str, record_type: DNSRecordType) -> Tuple[List[str], List[str]]:
+    """获取 IP 列表，返回 (ipv4_list, ipv6_list)"""
     response = requests.get(url)
     response.raise_for_status()
-    return response.text.strip().split('\n')
+    
+    ip_list = response.text.strip().split('\n')
+    ipv4_list = [ip for ip in ip_list if ':' not in ip]
+    ipv6_list = [ip for ip in ip_list if ':' in ip]
+    
+    # 根据记录类型过滤
+    if record_type == DNSRecordType.A_ONLY:
+        ipv6_list = []
+    elif record_type == DNSRecordType.AAAA_ONLY:
+        ipv4_list = []
+    
+    return ipv4_list, ipv6_list
 
 def get_auth_headers(api_token: str = None, email: str = None, api_key: str = None) -> dict:
     if api_token:
@@ -41,84 +73,81 @@ def get_cloudflare_zone(auth_params: dict, zone_name: str = None) -> Tuple[str, 
         raise Exception("No zones found")
     return zones[0]['id'], zones[0]['name']
 
-def delete_existing_dns_records(auth_params: dict, zone_id: str, subdomain: str, domain: str) -> None:
+def delete_existing_dns_records(auth_params: dict, zone_id: str, subdomain: str, domain: str, record_type: DNSRecordType = DNSRecordType.ALL) -> None:
+    """删除现有的 DNS 记录"""
     headers = get_auth_headers(**auth_params)
     record_name = domain if subdomain == '@' else f'{subdomain}.{domain}'
     
-    while True:
-        response = requests.get(
-            f'https://api.cloudflare.com/client/v4/zones/{zone_id}/dns_records',
-            params={'type': 'A', 'name': record_name},
-            headers=headers
-        )
-        response.raise_for_status()
-        records = response.json().get('result', [])
-        if not records:
-            break
-            
-        for record in records:
-            delete_response = requests.delete(
-                f'https://api.cloudflare.com/client/v4/zones/{zone_id}/dns_records/{record["id"]}',
+    # 确定需要删除的记录类型
+    record_types = []
+    if record_type in [DNSRecordType.ALL, DNSRecordType.A_ONLY]:
+        record_types.append("A")
+    if record_type in [DNSRecordType.ALL, DNSRecordType.AAAA_ONLY]:
+        record_types.append("AAAA")
+    
+    for dns_type in record_types:
+        while True:
+            response = requests.get(
+                f'https://api.cloudflare.com/client/v4/zones/{zone_id}/dns_records',
+                params={'type': dns_type, 'name': record_name},
                 headers=headers
             )
-            delete_response.raise_for_status()
-            logger.info(f"Deleted DNS record {subdomain}:{record['id']}")
+            response.raise_for_status()
+            records = response.json().get('result', [])
+            if not records:
+                break
+                
+            for record in records:
+                delete_response = requests.delete(
+                    f'https://api.cloudflare.com/client/v4/zones/{zone_id}/dns_records/{record["id"]}',
+                    headers=headers
+                )
+                delete_response.raise_for_status()
+                logger.info(f"Deleted DNS record {subdomain}:{record['id']} ({dns_type})")
 
-def update_cloudflare_dns(auth_params: dict, ip_list: List[str], zone_id: str, subdomain: str, domain: str) -> None:
+def update_cloudflare_dns(auth_params: dict, ip_lists: Tuple[List[str], List[str]], zone_id: str, subdomain: str, domain: str, record_type: DNSRecordType = DNSRecordType.ALL) -> None:
+    """更新 DNS 记录"""
     headers = get_auth_headers(**auth_params)
     record_name = domain if subdomain == '@' else f'{subdomain}.{domain}'
+    ipv4_list, ipv6_list = ip_lists
     
-    for ip in ip_list:
-        data = {
-            "type": "A",
-            "name": record_name,
-            "content": ip,
-            "ttl": 1,
-            "proxied": False
-        }
-        response = requests.post(
-            f'https://api.cloudflare.com/client/v4/zones/{zone_id}/dns_records',
-            json=data,
-            headers=headers
-        )
-        if response.status_code == 200:
-            logger.info(f"Added DNS record {subdomain}:{ip}")
-        else:
-            logger.error(f"Failed to add A record for IP {ip} to subdomain {subdomain}: {response.status_code} {response.text}")
+    def add_records(ips: List[str], dns_type: str) -> None:
+        for ip in ips:
+            data = {
+                "type": dns_type,
+                "name": record_name,
+                "content": ip,
+                "ttl": 1,
+                "proxied": False
+            }
+            response = requests.post(
+                f'https://api.cloudflare.com/client/v4/zones/{zone_id}/dns_records',
+                json=data,
+                headers=headers
+            )
+            if response.status_code == 200:
+                logger.info(f"Added DNS record {subdomain}:{ip} ({dns_type})")
+            else:
+                logger.error(f"Failed to add {dns_type} record for IP {ip} to subdomain {subdomain}: {response.status_code} {response.text}")
+    
+    # 根据记录类型添加相应的记录
+    if record_type in [DNSRecordType.ALL, DNSRecordType.A_ONLY]:
+        add_records(ipv4_list, "A")
+    if record_type in [DNSRecordType.ALL, DNSRecordType.AAAA_ONLY]:
+        add_records(ipv6_list, "AAAA")
 
 def batch_update_dns_records(
     auth_params: dict,
-    ip_list: List[str],
+    ip_lists: Tuple[List[str], List[str]],
     zone_id: str,
     subdomain: str,
-    domain: str
+    domain: str,
+    record_type: DNSRecordType
 ) -> None:
-    """Update DNS records using the batch API endpoint.
-    
-    Args:
-        auth_params: Authentication parameters for Cloudflare API
-        ip_list: List of IP addresses to set
-        zone_id: Cloudflare zone ID
-        subdomain: Subdomain to update (use '@' for root domain)
-        domain: Domain name
-        
-    Notes:
-        - Free plan has a limit of 200 operations per batch
-        - Operations are processed asynchronously by Cloudflare
-        - Uses patches for existing records to minimize propagation delay
-        - Ensures no overlap between patches and deletes
-    """
+    """Update DNS records using the batch API endpoint."""
     headers = get_auth_headers(**auth_params)
     record_name = domain if subdomain == '@' else f'{subdomain}.{domain}'
-    
-    # First get existing records for processing
-    response = requests.get(
-        f'https://api.cloudflare.com/client/v4/zones/{zone_id}/dns_records',
-        params={'type': 'A', 'name': record_name, 'per_page': 5000000},
-        headers=headers
-    )
-    response.raise_for_status()
-    existing_records = response.json().get('result', [])
+    ipv4_list, ipv6_list = ip_lists
     
     # Constants
     BATCH_LIMIT = 200
@@ -127,8 +156,9 @@ def batch_update_dns_records(
     
     def create_record_data(ip: str, record_name: str, record_id: str = None) -> dict:
         """Create DNS record data with consistent defaults"""
+        record_type = "A" if ':' not in ip else "AAAA"
         data = {
-            "type": "A",
+            "type": record_type,
             "name": record_name,
             "content": ip,
             "ttl": DEFAULT_TTL,
@@ -138,48 +168,74 @@ def batch_update_dns_records(
             data["id"] = record_id
         return data
     
-    logger.info(f"\nProcessing {subdomain}:")
-    logger.info(f"  Found {len(existing_records)} existing records")
-    logger.info(f"  Target {len(ip_list)} IPs")
+    def process_ip_type(ip_list: List[str], record_type: str) -> Tuple[List[dict], List[dict], List[dict]]:
+        """处理特定类型的 IP 地址记录"""
+        # 获取现有记录
+        response = requests.get(
+            f'https://api.cloudflare.com/client/v4/zones/{zone_id}/dns_records',
+            params={'type': record_type, 'name': record_name, 'per_page': 5000000},
+            headers=headers
+        )
+        response.raise_for_status()
+        existing_records = response.json().get('result', [])
+        
+        logger.info(f"\nProcessing {subdomain} {record_type} records:")
+        logger.info(f"  Found {len(existing_records)} existing records")
+        logger.info(f"  Target {len(ip_list)} IPs")
+        
+        patches = []
+        posts = []
+        used_records = set()
+        
+        existing_ip_map = {record["content"]: record for record in existing_records}
+        existing_ips = set(existing_ip_map.keys())
+        target_ips = set(ip_list)
+        
+        # 保留匹配的记录
+        for ip in target_ips.intersection(existing_ips):
+            record = existing_ip_map[ip]
+            used_records.add(record["id"])
+            logger.debug(f"  - Keeping {ip} (already exists)")
+        
+        # 处理新的 IP
+        new_ips = target_ips - existing_ips
+        available_records = [r for r in existing_records if r["id"] not in used_records]
+        
+        # 更新现有记录
+        patched_ips = set()
+        for ip, record in zip(new_ips, available_records):
+            patches.append(create_record_data(ip, record_name, record_id=record["id"]))
+            used_records.add(record["id"])
+            patched_ips.add(ip)
+            logger.debug(f"  - Patching {record['content']} -> {ip}")
+        
+        # 创建新记录
+        for ip in (new_ips - patched_ips):
+            posts.append(create_record_data(ip, record_name))
+            logger.info(f"  - Adding new record for {ip}")
+        
+        # 删除未使用的记录
+        deletes = [{"id": record["id"]} for record in existing_records 
+                  if record["id"] not in used_records]
+        
+        return patches, posts, deletes
     
-    # Initialize operation lists
-    patches = []
-    posts = []
-    used_records = set()
+    # 处理 IPv4 和 IPv6 记录
+    ipv4_patches, ipv4_posts, ipv4_deletes = ([], [], [])
+    ipv6_patches, ipv6_posts, ipv6_deletes = ([], [], [])
     
-    # Create maps and sets for efficient lookups
-    existing_ip_map = {record["content"]: record for record in existing_records}
-    existing_ips = set(existing_ip_map.keys())
-    target_ips = set(ip_list)
+    if record_type in [DNSRecordType.ALL, DNSRecordType.A_ONLY]:
+        ipv4_patches, ipv4_posts, ipv4_deletes = process_ip_type(ipv4_list, "A")
+        
+    if record_type in [DNSRecordType.ALL, DNSRecordType.AAAA_ONLY]:
+        ipv6_patches, ipv6_posts, ipv6_deletes = process_ip_type(ipv6_list, "AAAA")
     
-    # Keep existing records that match target IPs
-    for ip in target_ips.intersection(existing_ips):
-        record = existing_ip_map[ip]
-        used_records.add(record["id"])
-        logger.debug(f"  - Keeping {ip} (already exists)")
+    # 合并所有操作
+    all_patches = ipv4_patches + ipv6_patches
+    all_posts = ipv4_posts + ipv6_posts
+    all_deletes = ipv4_deletes + ipv6_deletes
     
-    # Handle new IPs using available records or create new ones
-    new_ips = target_ips - existing_ips
-    available_records = [r for r in existing_records if r["id"] not in used_records]
-    
-    # Update existing records where possible
-    patched_ips = set()
-    for ip, record in zip(new_ips, available_records):
-        patches.append(create_record_data(ip, record_name, record_id=record["id"]))
-        used_records.add(record["id"])
-        patched_ips.add(ip)
-        logger.debug(f"  - Patching {record['content']} -> {ip}")
-    
-    # Create new records for remaining IPs
-    for ip in (new_ips - patched_ips):
-        posts.append(create_record_data(ip, record_name))
-        print(f"  - Adding new record for {ip}")
-    
-    # Remove any unused records
-    deletes = [{"id": record["id"]} for record in existing_records 
-               if record["id"] not in used_records]
-    
-    total_operations = len(patches) + len(deletes) + len(posts)
+    total_operations = len(all_patches) + len(all_deletes) + len(all_posts)
     
     def process_batch(operations: list, batch_data: dict, operation_type: str, limit: int) -> tuple:
         """Process a batch of operations, returns (processed_count, operations_added)"""
@@ -192,9 +248,9 @@ def batch_update_dns_records(
     # Process in batches if total operations exceed the limit
     if total_operations > BATCH_LIMIT:
         operation_types = [
-            ("patches", patches),
-            ("deletes", deletes),
-            ("posts", posts)
+            ("patches", all_patches),
+            ("deletes", all_deletes),
+            ("posts", all_posts)
         ]
         
         # Process all operations in batches of up to BATCH_LIMIT operations
@@ -225,9 +281,9 @@ def batch_update_dns_records(
     else:
         # All operations can fit in a single batch
         batch_data = {
-            "patches": patches,
-            "deletes": deletes,
-            "posts": posts
+            "patches": all_patches,
+            "deletes": all_deletes,
+            "posts": all_posts
         }
         batch_data = {k: v for k, v in batch_data.items() if v}
         
@@ -243,25 +299,32 @@ def batch_update_dns_records(
         
         if response.status_code == 200:
             logger.info(f"Batch update successful for {subdomain}:")
-            logger.info(f"  - Patched {len(patches)} records")
-            logger.info(f"  - Deleted {len(deletes)} records")
-            logger.info(f"  - Added {len(posts)} records")
+            logger.info(f"  - Patched {len(all_patches)} records")
+            logger.info(f"  - Deleted {len(all_deletes)} records")
+            logger.info(f"  - Added {len(all_posts)} records")
         else:
             raise Exception(f"Batch update failed for {subdomain}: {response.status_code} {response.text}")
 
-def update_dns_records(auth_params: dict, ip_list: List[str], zone_id: str, subdomain: str, domain: str, use_batch: bool = True) -> None:
-    """Unified entry point for DNS updates. Can use either batch or individual updates based on the use_batch parameter"""
+def update_dns_records(
+    auth_params: dict, 
+    ip_lists: Tuple[List[str], List[str]], 
+    zone_id: str, 
+    subdomain: str, 
+    domain: str, 
+    use_batch: bool = True,
+    record_type: DNSRecordType = DNSRecordType.ALL
+) -> None:
+    """Unified entry point for DNS updates."""
     if use_batch:
         try:
-            batch_update_dns_records(auth_params, ip_list, zone_id, subdomain, domain)
+            batch_update_dns_records(auth_params, ip_lists, zone_id, subdomain, domain, record_type)
         except Exception as e:
             logger.warning(f"Batch update failed, falling back to individual updates: {e}")
-            delete_existing_dns_records(auth_params, zone_id, subdomain, domain)
-            update_cloudflare_dns(auth_params, ip_list, zone_id, subdomain, domain)
+            delete_existing_dns_records(auth_params, zone_id, subdomain, domain, record_type)
+            update_cloudflare_dns(auth_params, ip_lists, zone_id, subdomain, domain, record_type)
     else:
-        delete_existing_dns_records(auth_params, zone_id, subdomain, domain)
-        update_cloudflare_dns(auth_params, ip_list, zone_id, subdomain, domain)
-
+        delete_existing_dns_records(auth_params, zone_id, subdomain, domain, record_type)
+        update_cloudflare_dns(auth_params, ip_lists, zone_id, subdomain, domain, record_type)
 
 if __name__ == "__main__":
     # Support both authentication methods
@@ -274,6 +337,9 @@ if __name__ == "__main__":
     
     zone_name = os.getenv('CF_ZONE_NAME')
     use_batch = os.getenv('USE_BATCH', 'true').lower() == 'true'
+    record_type = DNSRecordType.from_string(os.getenv('DNS_RECORD_TYPE', 'all'))
+    
+    logger.info(f"DNS record type set to: {record_type.name}")
     
     subdomain_ip_mapping = {
         'bestcf.chore': 'https://raw.githubusercontent.com/killbus/youxuanyuming/refs/heads/data/ip.txt',
@@ -287,8 +353,19 @@ if __name__ == "__main__":
         zone_id, domain = get_cloudflare_zone(auth_params, zone_name)
 
         for subdomain, url in subdomain_ip_mapping.items():
-            ip_list = get_ip_list(url)[:10]
-            update_dns_records(auth_params, ip_list, zone_id, subdomain, domain, use_batch)
+            ipv4_list, ipv6_list = get_ip_list(url, record_type)
+            # 限制每种类型的 IP 数量
+            ipv4_list = ipv4_list[:10]
+            ipv6_list = ipv6_list[:10]
+            update_dns_records(
+                auth_params, 
+                (ipv4_list, ipv6_list), 
+                zone_id, 
+                subdomain, 
+                domain, 
+                use_batch,
+                record_type
+            )
             
     except Exception as e:
         logger.exception(f"Error: {e}")
