@@ -12,6 +12,24 @@ from dataclasses import dataclass
 from concurrent.futures import ThreadPoolExecutor
 from requests.adapters import HTTPAdapter
 from urllib3.util import Retry
+from enum import Enum, auto
+
+class IPVersion(Enum):
+    ALL = auto()
+    IPV4 = auto()
+    IPV6 = auto()
+    
+    @classmethod
+    def from_string(cls, value: str) -> 'IPVersion':
+        """从字符串转换为枚举值，无效值返回 ALL"""
+        try:
+            return {
+                'all': cls.ALL,
+                'ipv4': cls.IPV4,
+                'ipv6': cls.IPV6
+            }[value.lower()]
+        except KeyError:
+            return cls.ALL
 
 @dataclass
 class URLConfig:
@@ -22,10 +40,20 @@ class URLConfig:
 class Config:
     urls: List[URLConfig]
     output_file: str
-    ip_pattern: str = r'\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}'
+    ipv4_pattern: str = r'\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}'
+    ipv6_pattern: str = r'(?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}|(?:[0-9a-fA-F]{1,4}:){1,7}:|(?:[0-9a-fA-F]{1,4}:){1,6}:[0-9a-fA-F]{1,4}|(?:[0-9a-fA-F]{1,4}:){1,5}(?::[0-9a-fA-F]{1,4}){1,2}|(?:[0-9a-fA-F]{1,4}:){1,4}(?::[0-9a-fA-F]{1,4}){1,3}|(?:[0-9a-fA-F]{1,4}:){1,3}(?::[0-9a-fA-F]{1,4}){1,4}|(?:[0-9a-fA-F]{1,4}:){1,2}(?::[0-9a-fA-F]{1,4}){1,5}|[0-9a-fA-F]{1,4}:(?:(?::[0-9a-fA-F]{1,4}){1,6})|:(?:(?::[0-9a-fA-F]{1,4}){1,7}|:)|fe80:(?::[0-9a-fA-F]{0,4}){0,4}%[0-9a-zA-Z]{1,}'
     timeout: int = 10
     max_workers: int = 3
     v2dat_version: str = "20240712"
+    ip_version: IPVersion = IPVersion.from_string(os.getenv('IP_VERSION', 'all'))
+
+    def should_include_ipv4(self) -> bool:
+        """是否应该包含 IPv4 地址"""
+        return self.ip_version in (IPVersion.ALL, IPVersion.IPV4)
+    
+    def should_include_ipv6(self) -> bool:
+        """是否应该包含 IPv6 地址"""
+        return self.ip_version in (IPVersion.ALL, IPVersion.IPV6)
 
 def parse_table_ips(html: str, ip_pattern: str) -> Set[str]:
     """解析 HTML 表格中的 IP 地址."""
@@ -34,20 +62,25 @@ def parse_table_ips(html: str, ip_pattern: str) -> Set[str]:
     ips = set()
     for element in elements:
         element_text = element.get_text()
-        ip_matches = re.findall(ip_pattern, element_text)
-        ips.update(ip_matches)
+        ips.update(re.findall(ip_pattern, element_text))
     return ips
 
 def parse_comma_separated_ips(text: str, ip_pattern: str) -> Set[str]:
     """解析逗号分隔的 IP 地址."""
-    ip_matches = re.findall(ip_pattern, text)
-    return set(ip_matches)
+    return set(re.findall(ip_pattern, text))
 
 def parse_geoip_dat_file(filepath: str) -> Set[str]:
     """解析 geoip.dat 文件中的 IP 地址."""
     try:
         with open(filepath, 'r') as f:
-            return {line.strip() for line in f if line.strip() and ':' not in line}  # 排除 IPv6 地址
+            lines = {line.strip() for line in f if line.strip()}
+            
+            if Config.ip_version == IPVersion.IPV4:
+                return {line for line in lines if ':' not in line}
+            elif Config.ip_version == IPVersion.IPV6:
+                return {line for line in lines if ':' in line}
+            return lines
+            
     except Exception as e:
         logging.error(f"Error parsing geoip dat file: {e}")
         return set()
@@ -131,19 +164,40 @@ class CloudflareIPScraper:
             except Exception as e:
                 logging.error(f"Error cleaning up temporary files: {e}")
 
-    def get_cloudflare_ranges(self) -> Set[ipaddress.IPv4Network]:
+    def get_cloudflare_ranges(self) -> Set[ipaddress.IPv4Network | ipaddress.IPv6Network]:
         """获取所有 Cloudflare IP 范围."""
         try:
-            # 从官方 API 获取
-            v4_ranges = self.session.get('https://www.cloudflare.com/ips-v4', 
-                                       timeout=self.config.timeout).text.strip().split('\n')
-            cf_ranges = {ipaddress.ip_network(network) for network in v4_ranges}
+            cf_ranges = set()
+            
+            # 获取 IPv4 范围
+            if self.config.should_include_ipv4():
+                v4_ranges = self.session.get('https://www.cloudflare.com/ips-v4', 
+                                           timeout=self.config.timeout).text.strip().split('\n')
+                for network in v4_ranges:
+                    try:
+                        cf_ranges.add(ipaddress.ip_network(network))
+                    except ValueError:
+                        continue
+            
+            # 获取 IPv6 范围
+            if self.config.should_include_ipv6():
+                v6_ranges = self.session.get('https://www.cloudflare.com/ips-v6',
+                                           timeout=self.config.timeout).text.strip().split('\n')
+                for network in v6_ranges:
+                    try:
+                        cf_ranges.add(ipaddress.ip_network(network))
+                    except ValueError:
+                        continue
             
             # 从 geoip.dat 获取额外的范围
             v2dat_ips = self.get_v2dat_cloudflare_ips()
             for ip_range in v2dat_ips:
                 try:
-                    cf_ranges.add(ipaddress.ip_network(ip_range))
+                    network = ipaddress.ip_network(ip_range)
+                    if ((self.config.ip_version == IPVersion.IPV4 and isinstance(network, ipaddress.IPv4Network)) or
+                        (self.config.ip_version == IPVersion.IPV6 and isinstance(network, ipaddress.IPv6Network)) or
+                        self.config.ip_version == IPVersion.ALL):
+                        cf_ranges.add(network)
                 except ValueError:
                     continue
                     
@@ -152,7 +206,7 @@ class CloudflareIPScraper:
             logging.error(f"Error fetching Cloudflare ranges: {e}")
             return set()
 
-    def is_cloudflare_ip(self, ip: str, cf_ranges: Set[ipaddress.IPv4Network]) -> bool:
+    def is_cloudflare_ip(self, ip: str, cf_ranges: Set[ipaddress.IPv4Network | ipaddress.IPv6Network]) -> bool:
         try:
             ip_obj = ipaddress.ip_address(ip)
             return any(ip_obj in network for network in cf_ranges)
@@ -163,7 +217,12 @@ class CloudflareIPScraper:
         try:
             response = self.session.get(url, timeout=self.config.timeout)
             response.raise_for_status()
-            return parser(response.text, self.config.ip_pattern)
+            ips = set()
+            if self.config.should_include_ipv4():
+                ips.update(parser(response.text, self.config.ipv4_pattern))
+            if self.config.should_include_ipv6():
+                ips.update(parser(response.text, self.config.ipv6_pattern))
+            return ips
         except Exception as e:
             logging.error(f"Error scraping {url}: {e}")
             return set()
@@ -201,7 +260,8 @@ def main():
             URLConfig(url="https://ip.164746.xyz/ipTop10.html", parser=parse_comma_separated_ips),
             URLConfig(url="https://cf.090227.xyz", parser=parse_table_ips)
         ],
-        output_file='ip.txt'
+        output_file='ip.txt',
+        ip_version=IPVersion.from_string(os.getenv('IP_VERSION', 'all'))
     )
     
     scraper = CloudflareIPScraper(config)
