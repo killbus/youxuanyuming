@@ -1,4 +1,5 @@
 import os
+import sys
 import requests
 import logging
 from typing import Tuple, List
@@ -36,7 +37,8 @@ def get_ip_list(url: str, record_type: DNSRecordType) -> Tuple[List[str], List[s
     response = requests.get(url)
     response.raise_for_status()
     
-    ip_list = response.text.strip().split('\n')
+    # splitlines 同时兼容 LF/CRLF，并过滤空行和行首尾空白。
+    ip_list = [line.strip() for line in response.text.splitlines() if line.strip()]
     ipv4_list = [ip for ip in ip_list if ':' not in ip]
     ipv6_list = [ip for ip in ip_list if ':' in ip]
     
@@ -179,7 +181,8 @@ def batch_update_dns_records(
         response.raise_for_status()
         existing_records = response.json().get('result', [])
         
-        logger.info(f"\nProcessing {subdomain} {record_type} records:")
+        logger.info(f"Processing {subdomain} {record_type} records:")
+        logger.info(f"  Record name: {record_name}")
         logger.info(f"  Found {len(existing_records)} existing records")
         logger.info(f"  Target {len(ip_list)} IPs")
         
@@ -217,6 +220,13 @@ def batch_update_dns_records(
         # 删除未使用的记录
         deletes = [{"id": record["id"]} for record in existing_records 
                   if record["id"] not in used_records]
+
+        logger.info(f"  Existing IPs: {', '.join(sorted(existing_ips)) or '-'}")
+        logger.info(f"  Target IPs: {', '.join(sorted(target_ips)) or '-'}")
+        logger.info(
+            f"  Operations: patches={len(patches)}, posts={len(posts)}, "
+            f"deletes={len(deletes)}"
+        )
         
         return patches, posts, deletes
     
@@ -288,7 +298,7 @@ def batch_update_dns_records(
         batch_data = {k: v for k, v in batch_data.items() if v}
         
         if not batch_data:
-            print(f"No operations to perform for {subdomain}")
+            logger.info(f"No operations to perform for {subdomain}")
             return
 
         response = requests.post(
@@ -351,12 +361,18 @@ if __name__ == "__main__":
 
     try:
         zone_id, domain = get_cloudflare_zone(auth_params, zone_name)
+        logger.info(f"Zone: {domain} ({zone_id})")
 
         for subdomain, url in subdomain_ip_mapping.items():
             ipv4_list, ipv6_list = get_ip_list(url, record_type)
             # 限制每种类型的 IP 数量
             ipv4_list = ipv4_list[:10]
             ipv6_list = ipv6_list[:10]
+            if not ipv4_list and not ipv6_list:
+                logger.warning(
+                    f"No target IPs found for {subdomain}, skipping DNS update"
+                )
+                continue
             update_dns_records(
                 auth_params, 
                 (ipv4_list, ipv6_list), 
@@ -369,3 +385,4 @@ if __name__ == "__main__":
             
     except Exception as e:
         logger.exception(f"Error: {e}")
+        sys.exit(1)
